@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: super-fast-otp-bot
+    runtime: python
+    # Use this alternative when SQLite data must survive restarts/redeploys.
+    # Persistent disks require a paid Render service.
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.11
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: DATA_DIR
+        value: /var/data
+    disk:
+      name: bot-data
+      mountPath: /var/data
+      sizeGB: 1
