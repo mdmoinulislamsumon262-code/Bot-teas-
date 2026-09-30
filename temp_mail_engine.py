@@ -374,11 +374,11 @@ def _imap_connect(config: dict):
     if not host or not user:
         raise RuntimeError("IMAP host/user missing")
     if port == 143:
-        connection = imaplib.IMAP4(host, port)
+        connection = imaplib.IMAP4(host, port, timeout=15)
         # Never continue with a plaintext login when STARTTLS fails.
         connection.starttls(ssl.create_default_context())
     else:
-        connection = imaplib.IMAP4_SSL(host, port, ssl_context=ssl.create_default_context())
+        connection = imaplib.IMAP4_SSL(host, port, ssl_context=ssl.create_default_context(), timeout=15)
     connection.login(user, password)
     return connection
 
