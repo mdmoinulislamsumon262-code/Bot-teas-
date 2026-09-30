@@ -279,7 +279,7 @@ def _join_prompt_text() -> str:
     )
 
 
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML", threaded=True, num_threads=8)
 
 # Populated after the Shop integration module is loaded near the end of this
 # file.  Keeping these as optional hooks lets Main remain the primary router.
@@ -573,10 +573,18 @@ async def _create_temp_mail_account():
         attempts.append((provider, None, None))
 
     last_error = None
+    # Hard overall budget so Get Mail can never hang for minutes.
+    _create_deadline = time.monotonic() + 40.0
     for provider, domain, imap_config in attempts:
         try:
-            state = await temp_mail_engine.create_account(
-                provider, domain=domain, imap_config=imap_config
+            remaining = _create_deadline - time.monotonic()
+            if remaining <= 1:
+                break
+            state = await asyncio.wait_for(
+                temp_mail_engine.create_account(
+                    provider, domain=domain, imap_config=imap_config
+                ),
+                timeout=min(20.0, remaining),
             )
             state["expires_at"] = state["created_at"] + TEMP_MAIL_TTL_SECONDS
             logger.info("Temp Mail created via %s (%s)", provider, state["email"])
@@ -639,7 +647,9 @@ async def _check_temp_mail_for_user(user_id: int):
         mailbox_email = state["email"]
         delivered_count = 0
         try:
-            messages = await temp_mail_engine.fetch_messages(state)
+            messages = await asyncio.wait_for(
+                temp_mail_engine.fetch_messages(state), timeout=25
+            )
         except Exception as exc:
             _temp_mail_note_error(user_key, exc)
             return 0
@@ -745,7 +755,11 @@ def _run_temp_mail_coroutine(coroutine, timeout=45):
     if _temp_mail_loop is None:
         raise RuntimeError("Temp Mail background loop is unavailable")
     future = asyncio.run_coroutine_threadsafe(coroutine, _temp_mail_loop)
-    return future.result(timeout=timeout)
+    try:
+        return future.result(timeout=timeout)
+    except BaseException:
+        future.cancel()
+        raise
 
 
 def _start_temp_mail_background_loop():
@@ -773,7 +787,49 @@ def _start_temp_mail_background_loop():
         raise RuntimeError("Temp Mail background loop did not start")
 
 
+_temp_mail_busy_users = set()
+_temp_mail_busy_lock = threading.Lock()
+
+
+def _temp_mail_run_detached(user_id, chat_id, func):
+    """Run slow Temp Mail work in its own short-lived thread so Telegram
+    handler threads stay free and every other command keeps working."""
+    with _temp_mail_busy_lock:
+        if user_id in _temp_mail_busy_users:
+            try:
+                bot.send_message(chat_id, "⏳ আগের Temp Mail কাজটি চলছে, একটু অপেক্ষা করুন...")
+            except Exception:
+                pass
+            return
+        if len(_temp_mail_busy_users) >= 20:
+            try:
+                bot.send_message(chat_id, "⚠️ এখন অনেক request চলছে, কিছুক্ষণ পর আবার চেষ্টা করুন।")
+            except Exception:
+                pass
+            return
+        _temp_mail_busy_users.add(user_id)
+
+    def runner():
+        try:
+            func(chat_id, user_id)
+        except Exception as exc:
+            logger.warning("Temp Mail task failed for user=%s: %s", user_id, exc)
+        finally:
+            with _temp_mail_busy_lock:
+                _temp_mail_busy_users.discard(user_id)
+
+    threading.Thread(target=runner, daemon=True, name=f"temp-mail-{user_id}").start()
+
+
 def _send_generated_temp_mail(chat_id, user_id):
+    _temp_mail_run_detached(user_id, chat_id, _send_generated_temp_mail_now)
+
+
+def _send_temp_mail_check_result(chat_id, user_id):
+    _temp_mail_run_detached(user_id, chat_id, _send_temp_mail_check_result_now)
+
+
+def _send_generated_temp_mail_now(chat_id, user_id):
     try:
         state = _run_temp_mail_coroutine(_generate_temp_mail_for_user(user_id))
         email = _html.escape(state["email"])
@@ -801,7 +857,7 @@ def _send_generated_temp_mail(chat_id, user_id):
         )
 
 
-def _send_temp_mail_check_result(chat_id, user_id):
+def _send_temp_mail_check_result_now(chat_id, user_id):
     if not _get_temp_mail_user(user_id):
         new_kb = InlineKeyboardMarkup(row_width=1)
         new_kb.add(InlineKeyboardButton("➕ New Email", callback_data="temp_mail_new"))
